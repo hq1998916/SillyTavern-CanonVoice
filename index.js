@@ -3,6 +3,8 @@ import * as WI from '../../../world-info.js';
 
 let cv_backup_data = null;
 let cv_backup_name = "";
+// 新增：用于随时掐断网络请求的控制器
+let cv_abort_controller = null; 
 
 const extensionHtml = `
 <div id="canon-voice-settings" class="inline-drawer">
@@ -51,14 +53,19 @@ const extensionHtml = `
         <hr class="sysHR" />
         
         <div>
-            <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 5px;">
-                <label style="display:block; margin: 0;"><b>3. 缓冲池与入库 (直连数据库)</b></label>
-                <button id="cv_regenerate_btn" class="menu_button" style="padding: 3px 8px; font-size: 0.85em; line-height: 1;" title="AI格式错乱？点击一键重新生成">🔁 重新生成</button>
+            <!-- 【UI 修复】弹性布局 + 强制不换行，防止按钮变竖条 -->
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 5px; flex-wrap: wrap; gap: 5px;">
+                <label style="display:block; margin: 0; white-space: nowrap;"><b>3. 缓冲池与入库</b></label>
+                <div style="display: flex; gap: 5px;">
+                    <button id="cv_regenerate_btn" class="menu_button" style="padding: 3px 10px; font-size: 0.85em; white-space: nowrap;" title="AI格式错乱？点击一键重新生成">🔁 重新生成</button>
+                    <!-- 【新增】终止按钮 -->
+                    <button id="cv_stop_btn" class="menu_button" style="padding: 3px 10px; font-size: 0.85em; white-space: nowrap; color: #ff5555; display: none;" title="强制中止当前的 AI 请求">⏹️ 终止</button>
+                </div>
             </div>
             
             <div style="display: flex; gap: 8px; margin-bottom: 8px;">
                 <select id="cv_wb_select" class="text_pole" style="flex: 3; box-sizing: border-box;"></select>
-                <button id="cv_refresh_wb_btn" class="menu_button" style="flex: 1;" title="刷新列表">🔄 刷新</button>
+                <button id="cv_refresh_wb_btn" class="menu_button" style="flex: 1; white-space: nowrap;" title="刷新列表">🔄 刷新</button>
             </div>
             
             <textarea id="cv_result_preview" class="text_pole" rows="6" placeholder="AI 解析完的数据会暂存在这里缓冲。确认无误后点击下方按钮写入..." style="width: 100%; box-sizing: border-box; resize: vertical; margin-bottom: 10px;"></textarea>
@@ -269,12 +276,21 @@ async function initExtension() {
 
         $('#cv_process_btn').on('click', processSrtFile);
         $('#cv_regenerate_btn').on('click', processSrtFile);
-        $('#cv_refresh_wb_btn').on('click', async () => { await refreshWbDropdown(); toastr.success('列表已刷新'); });
-        $('#cv_commit_btn').on('click', commitToWorldBook);
-        $('#cv_undo_btn').on('click', undoCommit);
+        
+        // 【新增】：绑定终止按钮事件
+        $('#cv_stop_btn').on('click', () => {
+            if (cv_abort_controller) {
+                cv_abort_controller.abort();
+                toastr.warning('⏹️ 生成已被手动终止！');
+            }
+        });
         
         $('#cv_fetch_models_btn').on('click', fetchModels);
         $('#cv_save_api_btn').on('click', saveApiSettings);
+        
+        $('#cv_refresh_wb_btn').on('click', async () => { await refreshWbDropdown(); toastr.success('列表已刷新'); });
+        $('#cv_commit_btn').on('click', commitToWorldBook);
+        $('#cv_undo_btn').on('click', undoCommit);
 
         setTimeout(refreshWbDropdown, 1200);
 
@@ -298,13 +314,11 @@ async function initExtension() {
     }
 }
 
-// 【核心修复】智能容错回退机制
 async function processSrtFile() {
     const charName = $('#cv_character_name').val().trim() || "全部登场角色";
     const episode = $('#cv_episode').val().trim() || "未知集数";
     const fileInput = document.getElementById('cv_srt_upload');
     
-    // 生成时自动保存输入框内容
     localStorage.setItem('cv_custom_url', $('#cv_custom_url').val().trim());
     localStorage.setItem('cv_custom_key', $('#cv_custom_key').val().trim());
     localStorage.setItem('cv_custom_model', $('#cv_custom_model').val().trim());
@@ -320,49 +334,81 @@ async function processSrtFile() {
 
         $('#cv_result_preview').val("正在呼叫 AI，数据即将进入缓冲池，请耐心等待...");
         
+        // 开始生成：隐藏刷新，显示终止，防连点
+        $('#cv_regenerate_btn').hide();
+        $('#cv_stop_btn').show();
+        $('#cv_process_btn').prop('disabled', true);
+        
+        // 初始化强制中断控制器
+        if (cv_abort_controller) cv_abort_controller.abort();
+        cv_abort_controller = new AbortController();
+        const signal = cv_abort_controller.signal;
+        
         const customUrl = $('#cv_custom_url').val().trim();
         const customKey = $('#cv_custom_key').val().trim();
         const customModel = $('#cv_custom_model').val().trim();
         
         let fallbackToMain = false;
 
-        // 1. 判断是否具备独立调用条件（URL和KEY必须同时存在）
-        if (customUrl && customKey) {
-            toastr.info('🚀 正在使用 [独立 API] 进行解析...', 'Canon Voice', {timeOut: 3000});
-            try {
-                let endpoint = customUrl.endsWith('/chat/completions') ? customUrl : customUrl.replace(/\/$/, '') + '/chat/completions';
-                const fetchRes = await fetch(endpoint, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${customKey}` },
-                    body: JSON.stringify({ model: customModel || "gpt-3.5-turbo", messages: [{"role": "user", "content": prompt}], temperature: 0.1 })
-                });
-                
-                // 如果独立 API 报错（比如填错了Key报 401），直接抛出异常触发回退
-                if (!fetchRes.ok) throw new Error(`API 报错: ${fetchRes.status}`);
-                
-                const data = await fetchRes.json();
-                $('#cv_result_preview').val(data.choices[0].message.content);
-                toastr.success('✅ 独立 API 解析完成！已进入缓冲池。');
-            } catch (error) {
-                console.warn("[Canon Voice] 独立 API 请求失败，准备回退主 API:", error);
-                toastr.warning(`⚠️ 独立 API 失败 (${error.message})，自动回退使用 [酒馆主 API]...`);
-                fallbackToMain = true; // 触发接力
+        try {
+            if (customUrl && customKey) {
+                toastr.info('🚀 正在使用 [独立 API] 进行解析...', 'Canon Voice', {timeOut: 3000});
+                try {
+                    let endpoint = customUrl.endsWith('/chat/completions') ? customUrl : customUrl.replace(/\/$/, '') + '/chat/completions';
+                    
+                    // 把 signal 塞进 fetch 请求里，随时准备掐断
+                    const fetchRes = await fetch(endpoint, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${customKey}` },
+                        body: JSON.stringify({ model: customModel || "gpt-3.5-turbo", messages: [{"role": "user", "content": prompt}], temperature: 0.1 }),
+                        signal: signal 
+                    });
+                    
+                    if (!fetchRes.ok) throw new Error(`API 报错: ${fetchRes.status}`);
+                    
+                    const data = await fetchRes.json();
+                    $('#cv_result_preview').val(data.choices[0].message.content);
+                    toastr.success('✅ 独立 API 解析完成！已进入缓冲池。');
+                } catch (error) {
+                    if (error.name === 'AbortError') {
+                        $('#cv_result_preview').val("⚠️ 生成已被手动终止。");
+                        return; // 被手动终止则不再继续回退
+                    }
+                    console.warn("[Canon Voice] 独立 API 请求失败，准备回退主 API:", error);
+                    toastr.warning(`⚠️ 独立 API 失败 (${error.message})，自动回退使用 [酒馆主 API]...`);
+                    fallbackToMain = true; 
+                }
+            } else {
+                toastr.info('🔌 独立 API 尚未配置完整，自动回退使用 [酒馆主 API] 进行解析...', 'Canon Voice', {timeOut: 3000});
+                fallbackToMain = true;
             }
-        } else {
-            // URL 或 KEY 只要有一个没填，直接走主 API
-            toastr.info('🔌 独立 API 尚未配置完整，自动回退使用 [酒馆主 API] 进行解析...', 'Canon Voice', {timeOut: 3000});
-            fallbackToMain = true;
-        }
 
-        // 2. 主 API 容错接力执行区
-        if (fallbackToMain) {
-            try {
-                const currentApi = typeof MainScript.main_api !== 'undefined' ? MainScript.main_api : 'openai';
-                $('#cv_result_preview').val(await MainScript.generateRaw(prompt, currentApi, true));
-                toastr.success('✅ 酒馆主 API 解析完成！已进入缓冲池。');
-            } catch (mainError) {
-                $('#cv_result_preview').val("酒馆主 API 解析失败：\n" + mainError);
+            if (fallbackToMain) {
+                try {
+                    const currentApi = typeof MainScript.main_api !== 'undefined' ? MainScript.main_api : 'openai';
+                    
+                    // 用 Promise.race 监听终止事件，强行打断酒馆自带的生成等待
+                    const generatePromise = MainScript.generateRaw(prompt, currentApi, true);
+                    const abortPromise = new Promise((_, reject) => {
+                        signal.addEventListener('abort', () => reject(new DOMException('Aborted', 'AbortError')));
+                    });
+                    
+                    $('#cv_result_preview').val(await Promise.race([generatePromise, abortPromise]));
+                    toastr.success('✅ 酒馆主 API 解析完成！已进入缓冲池。');
+                } catch (mainError) {
+                    if (mainError.name === 'AbortError') {
+                        $('#cv_result_preview').val("⚠️ 生成已被手动终止。");
+                    } else {
+                        $('#cv_result_preview').val("酒馆主 API 解析失败：\n" + mainError);
+                    }
+                }
             }
+            
+        } finally {
+            // 无论成功还是失败，最后都把 UI 恢复原样
+            $('#cv_regenerate_btn').show();
+            $('#cv_stop_btn').hide();
+            $('#cv_process_btn').prop('disabled', false);
         }
     };
     reader.readAsText(fileInput.files[0]);
