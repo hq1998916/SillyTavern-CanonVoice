@@ -102,7 +102,7 @@ async function refreshWbDropdown() {
     }
 }
 
-// 精准获取旧数据
+// 【核心修复】精准获取旧数据，无论底层是对象还是数组都能准确提取，防止覆盖
 async function getWbData(name) {
     let bookData = null;
     
@@ -126,7 +126,7 @@ async function getWbData(name) {
         } catch(e) {}
     }
 
-    // 3. 强制把旧数据的 entries 洗成字典
+    // 3. 强制把旧数据的 entries 洗成字典，确保追加时的安全
     if (bookData) {
         let copy = JSON.parse(JSON.stringify(bookData));
         let normalizedEntries = {};
@@ -208,6 +208,18 @@ async function initExtension() {
         $('#cv_undo_btn').on('click', undoCommit);
 
         setTimeout(refreshWbDropdown, 1200);
+
+        // 【新增修复】读取浏览器记忆，按F5也能找回后悔药！
+        if (sessionStorage.getItem('cv_show_undo') === 'true') {
+            cv_backup_name = sessionStorage.getItem('cv_backup_name');
+            try {
+                cv_backup_data = JSON.parse(sessionStorage.getItem('cv_backup_data'));
+                $('#cv_undo_btn').show();
+            } catch (e) {
+                console.error("恢复备份失败", e);
+            }
+        }
+
     } catch (e) {
         console.error("加载面板失败：", e);
     }
@@ -275,6 +287,7 @@ async function commitToWorldBook() {
             if (!targetName) return; 
             wbData.name = targetName;
         } else {
+            // 获取旧数据
             wbData = await getWbData(selectedWb);
             if (!wbData.entries) wbData.entries = {};
         }
@@ -283,6 +296,7 @@ async function commitToWorldBook() {
         cv_backup_data = JSON.parse(JSON.stringify(wbData));
         cv_backup_name = targetName;
 
+        // 场景去重聚合
         const sceneMap = {};
         lines.forEach(item => {
             const sceneName = item.scene;
@@ -291,6 +305,7 @@ async function commitToWorldBook() {
             sceneMap[sceneName].dialogues.push(`[${item.speaker}] 说道：“${item.line.replace(/"/g, "'")}”`);
         });
 
+        // 获取当前最大的 UID，并在其后顺延
         let nextUid = -1;
         Object.values(wbData.entries).forEach(e => {
             const u = parseInt(e.uid);
@@ -318,6 +333,17 @@ async function commitToWorldBook() {
         if (writeSuccess) {
             toastr.success(`🎉 成功将 ${addedCount} 个场景追加到 [${targetName}]！`);
             $('#cv_undo_btn').show(); 
+            
+            // 【新增修复】把备份数据写进浏览器缓存，防刷新
+            sessionStorage.setItem('cv_backup_data', JSON.stringify(cv_backup_data));
+            sessionStorage.setItem('cv_backup_name', cv_backup_name);
+            sessionStorage.setItem('cv_show_undo', 'true');
+
+            // 【新增修复】强行触发UI重绘，不用再按 F5 了！
+            if ($('#world_editor_select').val() === targetName) {
+                $('#world_editor_select').trigger('change');
+            }
+
             if (selectedWb === '__NEW__') await refreshWbDropdown();
         } else {
             toastr.warning(`⚠️ 直连写入未成功，已为您下载合并后的文件，可直接导入！`);
@@ -330,48 +356,30 @@ async function commitToWorldBook() {
     }
 }
 
-// ==========================================
-// 【绝不乱改的终极撤回】学习酒馆助手思路，转数组并调用防拦截 API
-// ==========================================
 async function undoCommit() {
     if (!cv_backup_data || !cv_backup_name) return toastr.warning("没有可撤销的记录！");
     
     if (confirm(`确定要撤回刚才对 [${cv_backup_name}] 的追加写入吗？\n撤回后将恢复到追加前的状态。`)) {
-        try {
-            // 1. 学习酒馆助手思路：覆盖接口需要的是纯数组 (Array)，而不是带 uid 键的字典
-            let entriesArray = [];
-            if (cv_backup_data && cv_backup_data.entries) {
-                entriesArray = Object.values(cv_backup_data.entries).sort((a, b) => Number(a.uid) - Number(b.uid));
-            }
+        
+        // 深拷贝一份用来撤回，防止引用污染影响后续操作
+        const rollbackData = JSON.parse(JSON.stringify(cv_backup_data));
 
-            // 2. 优先调用酒馆官方全局的覆盖函数（自带防拦截和 UI 刷新）
-            if (typeof window.createOrReplaceWorldbook === 'function') {
-                await window.createOrReplaceWorldbook(cv_backup_name, entriesArray, { render: 'debounced' });
-                toastr.success(`↩️ 撤回成功，[${cv_backup_name}] 已恢复原状！`);
-                $('#cv_undo_btn').hide(); 
-                cv_backup_data = null;
-                return;
-            }
-            if (typeof WI.createOrReplaceWorldbook === 'function') {
-                await WI.createOrReplaceWorldbook(cv_backup_name, entriesArray, { render: 'debounced' });
-                toastr.success(`↩️ 撤回成功，[${cv_backup_name}] 已恢复原状！`);
-                $('#cv_undo_btn').hide(); 
-                cv_backup_data = null;
-                return;
-            }
+        if (await saveWbApi(cv_backup_name, rollbackData)) {
+            toastr.success(`↩️ 撤回成功，[${cv_backup_name}] 已恢复原状！`);
+            $('#cv_undo_btn').hide(); 
+            cv_backup_data = null;    
 
-            // 3. 保底：如果当前版本没有原生全局函数，则用你的老写法发给 API
-            if (await saveWbApi(cv_backup_name, cv_backup_data)) {
-                toastr.success(`↩️ 撤回成功，[${cv_backup_name}] 已恢复原状！`);
-                $('#cv_undo_btn').hide(); 
-                cv_backup_data = null;    
-            } else {
-                toastr.error("撤回失败！请检查控制台报错。");
-            }
+            // 【新增修复】撤销后清除记忆
+            sessionStorage.removeItem('cv_backup_data');
+            sessionStorage.removeItem('cv_backup_name');
+            sessionStorage.removeItem('cv_show_undo');
 
-        } catch (e) {
-            console.error("[CanonVoice] 撤回出错:", e);
-            toastr.error("撤回失败：" + String(e));
+            // 【新增修复】强行触发UI重绘，不用按 F5！
+            if ($('#world_editor_select').val() === cv_backup_name) {
+                $('#world_editor_select').trigger('change');
+            }
+        } else {
+            toastr.error("撤回失败！");
         }
     }
 }
