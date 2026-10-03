@@ -1,6 +1,7 @@
 {
     "display_name": "Canon Voice (原著台词库)",
     "loading_order": 50,
+    "version": "1.1.0",
     "requires": [],
     "optional": [],
     "js": "index.js"
