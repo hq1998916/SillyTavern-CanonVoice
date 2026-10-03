@@ -28,8 +28,14 @@ const extensionHtml = `
                 <input id="cv_custom_url" class="text_pole" type="text" placeholder="如: https://catiecli.sukaka.top/v1" style="width: 100%; box-sizing: border-box;" />
                 <label style="font-size: 0.9em; opacity: 0.8;">自定义 API 密钥:</label>
                 <input id="cv_custom_key" class="text_pole" type="password" placeholder="sk-..." style="width: 100%; box-sizing: border-box;" />
+                
                 <label style="font-size: 0.9em; opacity: 0.8;">自定义模型名称:</label>
-                <input id="cv_custom_model" class="text_pole" type="text" placeholder="如: gemini-1.5-flash" style="width: 100%; box-sizing: border-box;" />
+                <div style="display: flex; gap: 8px;">
+                    <input id="cv_custom_model" class="text_pole" type="text" list="cv_models_list" placeholder="手动填写 或 点击右侧" style="flex: 1; box-sizing: border-box;" />
+                    <button id="cv_fetch_models_btn" class="menu_button" style="padding: 0 15px; white-space: nowrap;" title="从 API 获取可用模型列表">拉取</button>
+                    <button id="cv_save_api_btn" class="menu_button" style="padding: 0 15px; white-space: nowrap;" title="保存当前 API 设置">保存</button>
+                </div>
+                <datalist id="cv_models_list"></datalist>
             </div>
         </details>
         
@@ -45,7 +51,11 @@ const extensionHtml = `
         <hr class="sysHR" />
         
         <div>
-            <label style="display:block; margin-bottom: 5px;"><b>3. 缓冲池与入库 (直连数据库)</b></label>
+            <div style="display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 5px;">
+                <label style="display:block; margin: 0;"><b>3. 缓冲池与入库 (直连数据库)</b></label>
+                <button id="cv_regenerate_btn" class="menu_button" style="padding: 3px 8px; font-size: 0.85em; line-height: 1;" title="AI格式错乱？点击一键重新生成">🔁 重新生成</button>
+            </div>
+            
             <div style="display: flex; gap: 8px; margin-bottom: 8px;">
                 <select id="cv_wb_select" class="text_pole" style="flex: 3; box-sizing: border-box;"></select>
                 <button id="cv_refresh_wb_btn" class="menu_button" style="flex: 1;" title="刷新列表">🔄 刷新</button>
@@ -64,7 +74,6 @@ const extensionHtml = `
 </div>
 `;
 
-// 获取安全令牌
 function getHeaders() {
     if (typeof MainScript.getRequestHeaders === 'function') {
         return MainScript.getRequestHeaders();
@@ -74,7 +83,6 @@ function getHeaders() {
     return headers;
 }
 
-// 刷新世界书下拉框
 async function refreshWbDropdown() {
     const select = $('#cv_wb_select');
     select.empty();
@@ -102,11 +110,71 @@ async function refreshWbDropdown() {
     }
 }
 
-// 【核心修复】精准获取旧数据，无论底层是对象还是数组都能准确提取，防止覆盖
+async function saveApiSettings() {
+    const customUrl = $('#cv_custom_url').val().trim();
+    const customKey = $('#cv_custom_key').val().trim();
+    const customModel = $('#cv_custom_model').val().trim();
+    
+    localStorage.setItem('cv_custom_url', customUrl);
+    localStorage.setItem('cv_custom_key', customKey);
+    localStorage.setItem('cv_custom_model', customModel);
+    
+    if (!customUrl || !customKey) {
+        toastr.success('✅ API 信息已更新！检测到信息未填全，生成时将自动回退主 API。');
+    } else {
+        toastr.success('✅ 独立 API 设置已保存！');
+    }
+}
+
+async function fetchModels() {
+    const baseUrl = $('#cv_custom_url').val().trim();
+    const apiKey = $('#cv_custom_key').val().trim();
+    
+    if (!baseUrl) return toastr.warning("请先填写自定义 API URL！");
+
+    try {
+        toastr.info("正在拉取模型列表...");
+        let endpoint = baseUrl.endsWith('/chat/completions') 
+            ? baseUrl.replace('/chat/completions', '/models') 
+            : baseUrl.replace(/\/$/, '') + '/models';
+            
+        const res = await fetch(endpoint, {
+            method: 'GET',
+            headers: { 'Authorization': `Bearer ${apiKey}` }
+        });
+        
+        if (!res.ok) throw new Error(`HTTP 报错: ${res.status}`);
+        
+        const data = await res.json();
+        const models = data.data ? data.data.map(m => m.id) : (Array.isArray(data) ? data.map(m => m.id || m) : []);
+        
+        if (models.length === 0) throw new Error("未获取到模型数据");
+
+        const dataList = $('#cv_models_list');
+        dataList.empty();
+        
+        const currentModelVal = $('#cv_custom_model').val().trim();
+        let isModelInNewList = false;
+
+        models.sort().forEach(m => {
+            if (m === currentModelVal) isModelInNewList = true;
+            dataList.append($('<option>', { value: m }));
+        });
+        
+        if (!isModelInNewList) {
+            $('#cv_custom_model').val('');
+        }
+        
+        toastr.success(`✅ 成功拉取 ${models.length} 个模型！请点击输入框选择。`);
+    } catch (e) {
+        console.error("[CanonVoice] 拉取模型失败:", e);
+        toastr.error("拉取失败，请检查 URL 和 密钥，或直接手动填写模型名。");
+    }
+}
+
 async function getWbData(name) {
     let bookData = null;
     
-    // 1. 智能适配读取内存
     if (WI.world_info) {
         if (Array.isArray(WI.world_info)) {
             bookData = WI.world_info.find(b => b && b.name === name);
@@ -115,7 +183,6 @@ async function getWbData(name) {
         }
     }
     
-    // 2. 内存读取失败的保底
     if (!bookData) {
         try {
             const res = await fetch('/api/worldinfo/get', { method: 'POST', headers: getHeaders(), body: JSON.stringify({name: name}) });
@@ -126,7 +193,6 @@ async function getWbData(name) {
         } catch(e) {}
     }
 
-    // 3. 强制把旧数据的 entries 洗成字典，确保追加时的安全
     if (bookData) {
         let copy = JSON.parse(JSON.stringify(bookData));
         let normalizedEntries = {};
@@ -144,10 +210,8 @@ async function getWbData(name) {
     return { entries: {}, name: name };
 }
 
-// 写入数据
 async function saveWbApi(name, wbData) {
     try {
-        // 更新内存
         if (WI.world_info) {
             if (Array.isArray(WI.world_info)) {
                 let idx = WI.world_info.findIndex(b => b && b.name === name);
@@ -158,7 +222,6 @@ async function saveWbApi(name, wbData) {
             }
         }
 
-        // 调用酒馆原生保存
         if (typeof WI.editWorldInfo === 'function') {
             await WI.editWorldInfo(name, wbData);
             if (typeof WI.loadWorldInfo === 'function') await WI.loadWorldInfo();
@@ -196,6 +259,8 @@ function triggerDownload(wbData, fileName) {
 
 async function initExtension() {
     try {
+        if ($('#canon-voice-settings').length > 0) return;
+
         $('#extensions_settings').append(extensionHtml);
         
         $('#cv_custom_url').val(localStorage.getItem('cv_custom_url') || '');
@@ -203,18 +268,26 @@ async function initExtension() {
         $('#cv_custom_model').val(localStorage.getItem('cv_custom_model') || '');
 
         $('#cv_process_btn').on('click', processSrtFile);
+        $('#cv_regenerate_btn').on('click', processSrtFile);
         $('#cv_refresh_wb_btn').on('click', async () => { await refreshWbDropdown(); toastr.success('列表已刷新'); });
         $('#cv_commit_btn').on('click', commitToWorldBook);
         $('#cv_undo_btn').on('click', undoCommit);
+        
+        $('#cv_fetch_models_btn').on('click', fetchModels);
+        $('#cv_save_api_btn').on('click', saveApiSettings);
 
         setTimeout(refreshWbDropdown, 1200);
 
-        // 【新增修复】读取浏览器记忆，按F5也能找回后悔药！
         if (sessionStorage.getItem('cv_show_undo') === 'true') {
             cv_backup_name = sessionStorage.getItem('cv_backup_name');
             try {
                 cv_backup_data = JSON.parse(sessionStorage.getItem('cv_backup_data'));
                 $('#cv_undo_btn').show();
+                
+                const savedText = sessionStorage.getItem('cv_buffer_text');
+                if (savedText) {
+                    $('#cv_result_preview').val(savedText);
+                }
             } catch (e) {
                 console.error("恢复备份失败", e);
             }
@@ -225,11 +298,13 @@ async function initExtension() {
     }
 }
 
+// 【核心修复】智能容错回退机制
 async function processSrtFile() {
     const charName = $('#cv_character_name').val().trim() || "全部登场角色";
     const episode = $('#cv_episode').val().trim() || "未知集数";
     const fileInput = document.getElementById('cv_srt_upload');
     
+    // 生成时自动保存输入框内容
     localStorage.setItem('cv_custom_url', $('#cv_custom_url').val().trim());
     localStorage.setItem('cv_custom_key', $('#cv_custom_key').val().trim());
     localStorage.setItem('cv_custom_model', $('#cv_custom_model').val().trim());
@@ -245,25 +320,49 @@ async function processSrtFile() {
 
         $('#cv_result_preview').val("正在呼叫 AI，数据即将进入缓冲池，请耐心等待...");
         
-        try {
-            const customUrl = $('#cv_custom_url').val().trim();
-            if (customUrl) {
+        const customUrl = $('#cv_custom_url').val().trim();
+        const customKey = $('#cv_custom_key').val().trim();
+        const customModel = $('#cv_custom_model').val().trim();
+        
+        let fallbackToMain = false;
+
+        // 1. 判断是否具备独立调用条件（URL和KEY必须同时存在）
+        if (customUrl && customKey) {
+            toastr.info('🚀 正在使用 [独立 API] 进行解析...', 'Canon Voice', {timeOut: 3000});
+            try {
                 let endpoint = customUrl.endsWith('/chat/completions') ? customUrl : customUrl.replace(/\/$/, '') + '/chat/completions';
                 const fetchRes = await fetch(endpoint, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${$('#cv_custom_key').val().trim()}` },
-                    body: JSON.stringify({ model: $('#cv_custom_model').val().trim() || "gpt-3.5-turbo", messages: [{"role": "user", "content": prompt}], temperature: 0.1 })
+                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${customKey}` },
+                    body: JSON.stringify({ model: customModel || "gpt-3.5-turbo", messages: [{"role": "user", "content": prompt}], temperature: 0.1 })
                 });
+                
+                // 如果独立 API 报错（比如填错了Key报 401），直接抛出异常触发回退
                 if (!fetchRes.ok) throw new Error(`API 报错: ${fetchRes.status}`);
+                
                 const data = await fetchRes.json();
                 $('#cv_result_preview').val(data.choices[0].message.content);
-            } else {
+                toastr.success('✅ 独立 API 解析完成！已进入缓冲池。');
+            } catch (error) {
+                console.warn("[Canon Voice] 独立 API 请求失败，准备回退主 API:", error);
+                toastr.warning(`⚠️ 独立 API 失败 (${error.message})，自动回退使用 [酒馆主 API]...`);
+                fallbackToMain = true; // 触发接力
+            }
+        } else {
+            // URL 或 KEY 只要有一个没填，直接走主 API
+            toastr.info('🔌 独立 API 尚未配置完整，自动回退使用 [酒馆主 API] 进行解析...', 'Canon Voice', {timeOut: 3000});
+            fallbackToMain = true;
+        }
+
+        // 2. 主 API 容错接力执行区
+        if (fallbackToMain) {
+            try {
                 const currentApi = typeof MainScript.main_api !== 'undefined' ? MainScript.main_api : 'openai';
                 $('#cv_result_preview').val(await MainScript.generateRaw(prompt, currentApi, true));
+                toastr.success('✅ 酒馆主 API 解析完成！已进入缓冲池。');
+            } catch (mainError) {
+                $('#cv_result_preview').val("酒馆主 API 解析失败：\n" + mainError);
             }
-            toastr.success('✅ 解析完成！已进入缓冲池。');
-        } catch (error) {
-            $('#cv_result_preview').val("解析失败：\n" + error);
         }
     };
     reader.readAsText(fileInput.files[0]);
@@ -285,18 +384,17 @@ async function commitToWorldBook() {
         if (selectedWb === '__NEW__') {
             targetName = prompt("请输入新世界书的名称：", `【${$('#cv_character_name').val().trim() || "群像"}】原著台词库`);
             if (!targetName) return; 
+            wbData = await getWbData(targetName);
             wbData.name = targetName;
+            if (!wbData.entries) wbData.entries = {};
         } else {
-            // 获取旧数据
             wbData = await getWbData(selectedWb);
             if (!wbData.entries) wbData.entries = {};
         }
 
-        // 备份数据用于撤回
         cv_backup_data = JSON.parse(JSON.stringify(wbData));
         cv_backup_name = targetName;
 
-        // 场景去重聚合
         const sceneMap = {};
         lines.forEach(item => {
             const sceneName = item.scene;
@@ -305,7 +403,6 @@ async function commitToWorldBook() {
             sceneMap[sceneName].dialogues.push(`[${item.speaker}] 说道：“${item.line.replace(/"/g, "'")}”`);
         });
 
-        // 获取当前最大的 UID，并在其后顺延
         let nextUid = -1;
         Object.values(wbData.entries).forEach(e => {
             const u = parseInt(e.uid);
@@ -334,12 +431,11 @@ async function commitToWorldBook() {
             toastr.success(`🎉 成功将 ${addedCount} 个场景追加到 [${targetName}]！`);
             $('#cv_undo_btn').show(); 
             
-            // 【新增修复】把备份数据写进浏览器缓存，防刷新
+            sessionStorage.setItem('cv_buffer_text', resultText);
             sessionStorage.setItem('cv_backup_data', JSON.stringify(cv_backup_data));
             sessionStorage.setItem('cv_backup_name', cv_backup_name);
             sessionStorage.setItem('cv_show_undo', 'true');
 
-            // 【新增修复】强行触发UI重绘，不用再按 F5 了！
             if ($('#world_editor_select').val() === targetName) {
                 $('#world_editor_select').trigger('change');
             }
@@ -352,7 +448,7 @@ async function commitToWorldBook() {
         
     } catch (e) {
         console.error(e);
-        toastr.error("处理失败，请检查框内 JSON 格式是否完整！");
+        toastr.error("处理失败，请检查框内 JSON 格式是否完整！\n错误详情: " + e.message);
     }
 }
 
@@ -360,8 +456,6 @@ async function undoCommit() {
     if (!cv_backup_data || !cv_backup_name) return toastr.warning("没有可撤销的记录！");
     
     if (confirm(`确定要撤回刚才对 [${cv_backup_name}] 的追加写入吗？\n撤回后将恢复到追加前的状态。`)) {
-        
-        // 深拷贝一份用来撤回，防止引用污染影响后续操作
         const rollbackData = JSON.parse(JSON.stringify(cv_backup_data));
 
         if (await saveWbApi(cv_backup_name, rollbackData)) {
@@ -369,12 +463,10 @@ async function undoCommit() {
             $('#cv_undo_btn').hide(); 
             cv_backup_data = null;    
 
-            // 【新增修复】撤销后清除记忆
             sessionStorage.removeItem('cv_backup_data');
             sessionStorage.removeItem('cv_backup_name');
             sessionStorage.removeItem('cv_show_undo');
 
-            // 【新增修复】强行触发UI重绘，不用按 F5！
             if ($('#world_editor_select').val() === cv_backup_name) {
                 $('#world_editor_select').trigger('change');
             }
